@@ -1,0 +1,31 @@
+name: "APRS-IS Weather Publisher"
+version: "0.1.0"
+slug: "aprs_weather"
+description: "Publish Davis Vantage Vue Home Assistant sensors as APRS-IS weather packets"
+url: "https://github.com/alevie76-dev/ha-aprs-weather-publisher"
+arch:
+  - aarch64
+  - armv7
+  - amd64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+options:
+  callsign: "KH7AL-13"
+  aprs_passcode: ""
+  latitude: 0.0
+  longitude: 0.0
+  dry_run: true
+  interval_seconds: 300
+  aprs_server: "noam.aprs2.net"
+  aprs_port: 14580
+schema:
+  callsign: str
+  aprs_passcode: password?
+  latitude: float
+  longitude: float
+  dry_run: bool
+  interval_seconds: int(60,3600)
+  aprs_server: str
+  aprs_port: port
