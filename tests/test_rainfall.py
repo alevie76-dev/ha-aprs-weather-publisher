@@ -76,7 +76,7 @@ OPTS = {
 }
 PACKET_RE = re.compile(
     r"^KH7AL-13>APRS,TCPIP\*:!\d{4}\.\d{2}[NS]/\d{5}\.\d{2}[EW]_"
-    r"\d{3}/\d{3}g\d{3}t-?\d{2,3}(?P<rain>(?:r\d{3})?(?:p\d{3})?(?:P\d{3})?)h\d{2}b\d{5}$"
+    r"(?:\d{3}|\.{3})/\d{3}g\d{3}t-?\d{2,3}(?P<rain>(?:r\d{3})?(?:p\d{3})?(?:P\d{3})?)h\d{2}b\d{5}$"
 )
 
 
@@ -286,7 +286,7 @@ class ConfigCompatibility(unittest.TestCase):
         for key in ("rain_1h_entity", "rain_24h_entity"):
             self.assertNotIn(key, opt_keys)
             self.assertTrue(schema_map[key].endswith("?"), key)
-        self.assertIn('version: "1.1.1"', text)
+        self.assertIn('version: "1.1.2"', text)
 
 
 class MissingAndStale(unittest.TestCase):

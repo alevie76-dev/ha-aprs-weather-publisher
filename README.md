@@ -2,7 +2,7 @@
 
 A Home Assistant app repository for publishing Davis Vantage Vue weather observations via APRS-IS as `KH7AL-13`.
 
-**Version 1.1.1: 1-hour (`r`) and 24-hour (`p`) rainfall, plus reliability fixes. Dry-run by default.**
+**Version 1.1.2: 1-hour (`r`) and 24-hour (`p`) rainfall, calm-wind and outage handling. Dry-run by default.**
 
 ## Installation
 

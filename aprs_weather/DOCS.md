@@ -12,7 +12,8 @@
 ## Packet contents
 
 - Position: APRS latitude/longitude with weather symbol `_`.
-- Wind direction: `sensor.davis_vantage_wind_direction_average` (degrees).
+- Wind direction: `sensor.davis_vantage_wind_direction_average` (degrees). The Davis integration leaves this sensor `unknown` in calm air (average speed 0) and when the vane reports no direction. The packet then carries the standard APRS missing direction `...` (e.g. `_.../000g003…`), never an invented or zero direction.
+- Log levels: a temporary outage (sensor `unknown`/`unavailable`, Home Assistant restarting, stale data) logs `WARNING Report skipped (temporary, will retry)`. A missing entity, wrong unit or malformed value logs `ERROR Report skipped (configuration problem)`, which needs your attention.
 - Wind speed: `sensor.davis_vantage_wind_speed_average` (mph).
 - Gust: `sensor.davis_vantage_wind_gust` (mph).
 - Temperature: `sensor.davis_vantage_temperature` (F).

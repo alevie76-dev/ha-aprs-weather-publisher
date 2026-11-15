@@ -33,13 +33,36 @@ ROLLING_RAIN_OPTIONS = {"r": "rain_1h_entity", "p": "rain_24h_entity"}
 ENTITY_ID = re.compile(r"sensor\.[a-z0-9_]+")
 
 
+# Home Assistant states meaning "no current value" (outage, startup, calm wind).
+NO_DATA_STATES = ("unknown", "unavailable", "none", "")
+
+
+class TemporaryDataError(ValueError):
+    """Data is temporarily missing or stale; expected to recover on its own."""
+
+
+class ConfigurationError(ValueError):
+    """A configured entity is missing or reports malformed data; needs attention."""
+
+
 def get_entity(entity_id, token):
     request = urllib.request.Request(
         "http://supervisor/core/api/states/" + entity_id,
         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise ConfigurationError(
+                f"Entity {entity_id} not found in Home Assistant; check the Davis integration entity IDs"
+            ) from exc
+        if exc.code in (401, 403):
+            raise ConfigurationError(f"Home Assistant API refused access (HTTP {exc.code}); check homeassistant_api") from exc
+        raise TemporaryDataError(f"Home Assistant API error for {entity_id} (HTTP {exc.code})") from exc
+    except urllib.error.URLError as exc:
+        raise TemporaryDataError(f"Home Assistant API unreachable ({exc.reason})") from exc
 
 
 def local_timezone(token):
@@ -63,12 +86,15 @@ def local_timezone(token):
 
 
 def numeric(entity, expected_unit=None):
-    if entity["state"] in ("unknown", "unavailable", "none", ""):
-        raise ValueError("Sensor unavailable: " + entity["entity_id"])
+    if entity["state"] in NO_DATA_STATES:
+        raise TemporaryDataError("Sensor unavailable: " + entity["entity_id"])
     unit = entity.get("attributes", {}).get("unit_of_measurement")
     if expected_unit and unit != expected_unit:
-        raise ValueError(f"Unexpected unit for {entity['entity_id']}: {unit!r} (expected {expected_unit!r})")
-    result = float(entity["state"])
+        raise ConfigurationError(f"Unexpected unit for {entity['entity_id']}: {unit!r} (expected {expected_unit!r})")
+    try:
+        result = float(entity["state"])
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"Non-numeric state for {entity['entity_id']}: {str(entity['state'])[:40]!r}") from exc
     if not math.isfinite(result):
         raise ValueError("Nonfinite sensor: " + entity["entity_id"])
     return result
@@ -90,16 +116,33 @@ def position(lat, lon):
 
 
 def observation_time(entities):
-    last = entities["last_success"]["state"]
+    """Time of the Davis observation; rejects missing, malformed and stale timestamps.
+
+    Accepts ISO 8601 with a UTC offset or ``Z`` (Home Assistant serializes
+    timestamp sensors as e.g. ``2026-11-15T20:31:05.123456+00:00``).
+    """
+    entity = entities["last_success"]
+    last = entity.get("state")
+    if last is None or str(last).strip().lower() in NO_DATA_STATES:
+        raise TemporaryDataError(
+            f"Davis last-success time is {last!r}: the integration has no current reading "
+            "(Home Assistant starting up or console unreachable)"
+        )
+    text = str(last).strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"  # also supports Python < 3.11
     try:
-        timestamp = dt.datetime.fromisoformat(last.replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            raise ValueError("Missing timezone")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Invalid Davis last-success timestamp") from exc
+        timestamp = dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"Invalid Davis last-success timestamp {text[:40]!r}; expected ISO 8601 with a time zone. "
+            f"Check that {entity.get('entity_id')} is the integration's last-success timestamp sensor"
+        ) from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ConfigurationError(f"Davis last-success timestamp {text[:40]!r} has no time zone; cannot determine its age")
     age = (dt.datetime.now(dt.timezone.utc) - timestamp).total_seconds()
     if age < -120 or age > 900:
-        raise ValueError(f"Davis observations stale or clock incorrect (age {age:.0f}s)")
+        raise TemporaryDataError(f"Davis observations stale or clock incorrect (age {age:.0f}s)")
     return timestamp
 
 
@@ -127,8 +170,16 @@ def packet(opts, entities, rain=None):
     observation_time(entities)
     temp = numeric(entities["temperature"], "°F")
     humidity = numeric(entities["humidity"], "%")
-    direction = numeric(entities["direction"], "°")
     speed = numeric(entities["speed"], "mph")
+    try:
+        direction = numeric(entities["direction"], "°")
+    except TemporaryDataError:
+        # The Davis integration leaves average direction unset in calm air (and
+        # when the vane reports no direction). APRS represents unknown wind
+        # direction as "..."; never invent a direction or send 000.
+        direction = None
+        LOG.info("Wind direction %s; sending APRS missing direction '...'",
+                 "undefined in calm air" if speed == 0 else "temporarily unavailable")
     gust = numeric(entities["gust"], "mph")
     pressure_inhg = numeric(entities["pressure"], "inHg")
     if rain is None:
@@ -137,14 +188,15 @@ def packet(opts, entities, rain=None):
         raise ValueError("Temperature, humidity or wind reading outside expected range")
     if not (25 <= pressure_inhg <= 32):
         raise ValueError("Pressure outside plausible sea-level inHg range; verify Davis sensor mapping")
-    if not (0 <= direction <= 360):
+    if direction is not None and not (0 <= direction <= 360):
         raise ValueError("Invalid wind direction")
+    direction_text = "..." if direction is None else f"{round(direction) % 360:03d}"
     h = 0 if round(humidity) == 100 else round(humidity)
     pressure_tenths = round(pressure_inhg * 33.8638866667 * 10)
     # APRS order: r (last 60 min), p (last 24 h), P (since midnight),
     # hundredths of an inch. Unknown values are omitted, never sent as zero.
     weather = (
-        f"{round(direction) % 360:03d}/{round(speed):03d}"
+        f"{direction_text}/{round(speed):03d}"
         f"g{round(gust):03d}t{round(temp):03d}"
         f"{rain_field('r', rain.get('r'))}{rain_field('p', rain.get('p'))}{rain_field('P', rain.get('P'))}"
         f"h{h:02d}b{pressure_tenths:05d}"
@@ -225,9 +277,9 @@ def run_cycle(opts, token, history):
     """Fetch sensors, build one packet, and log or transmit it. Returns the packet."""
     entities = {key: get_entity(value, token) for key, value in SENSORS.items()}
     observed = observation_time(entities)
-    if history.tz is None:
-        history.tz = local_timezone(token)
     try:
+        if history.tz is None:
+            history.tz = local_timezone(token)
         rain = collect_rain(opts, token, history, observed)
     except Exception as exc:
         # Rainfall must never block an otherwise valid weather report.
@@ -263,6 +315,10 @@ def main():
                     LOG.warning("Rainfall history could not be loaded (%s); starting fresh", exc)
                     history.samples = []
             run_cycle(opts, token, history)
+        except TemporaryDataError as exc:
+            LOG.warning("Report skipped (temporary, will retry): %s", exc)
+        except ConfigurationError as exc:
+            LOG.error("Report skipped (configuration problem): %s", exc)
         except Exception as exc:
             LOG.error("Report skipped: %s", exc)
         time.sleep(interval)

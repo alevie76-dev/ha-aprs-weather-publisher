@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.2
+
+Fixes for two production errors. Neither was a regression from 1.1.0: both came from the Davis integration briefly having no data.
+
+- Fix: `Report skipped: Sensor unavailable: sensor.davis_vantage_wind_direction_average`. The Davis integration leaves average wind direction `unknown` in calm air. Reports are now sent with the APRS missing direction `...`, never an invented or zero direction.
+- Fix: `Report skipped: Invalid Davis last-success timestamp`. This appeared when the sensor was `unknown`/`unavailable` (Home Assistant starting up or console unreachable). It is now reported as a temporary outage and retried. Timestamp parsing accepts ISO 8601 with offsets or `Z`, and rejects malformed, naive or stale timestamps. The 15-minute maximum age is unchanged.
+- Logs now separate temporary outages (`WARNING … temporary, will retry`) from configuration problems such as a missing entity, wrong unit or malformed value (`ERROR … configuration problem`).
+- Time-zone lookup is now inside the rainfall safety net, so it cannot block a weather report.
+- APRS-IS login, connection, station settings and reporting interval are unchanged. Added 20 regression tests (56 total).
+
 ## 1.1.1
 
 Reliability fixes for rainfall reporting. APRS-IS login, connection, reporting interval and the other weather fields are unchanged.

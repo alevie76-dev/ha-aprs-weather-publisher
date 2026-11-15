@@ -1,5 +1,5 @@
 name: "APRS-IS Weather Publisher"
-version: "1.1.1"
+version: "1.1.2"
 slug: "aprs_weather"
 description: "Publish Davis Vantage Vue Home Assistant sensors as APRS-IS weather packets"
 url: "https://github.com/alevie76-dev/ha-aprs-weather-publisher"
