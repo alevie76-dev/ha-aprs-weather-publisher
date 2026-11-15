@@ -236,6 +236,59 @@ class RestartPersistence(unittest.TestCase):
             self.assertEqual(h.samples, [])
 
 
+class Retention(unittest.TestCase):
+    def test_history_is_bounded_and_keeps_24h_boundary(self):
+        h = new_history()
+        now = local(2026, 11, 15, 10, 2)
+        events = [(local(2026, 11, 14, 10, 4), 0.11)]  # just inside the 24 h window
+        feed(h, now - 4 * 86400, now, daily_counter(events))
+        self.assertLessEqual(len(h.samples), rainfall.RETENTION_SECONDS // STEP + 1)
+        self.assertGreaterEqual(h.samples[0][0], now - rainfall.RETENTION_SECONDS)
+        # Baseline observation at or before the 24 h window start is retained.
+        self.assertTrue(any(t <= now - rainfall.DAY for t, _ in h.samples))
+        self.assertAlmostEqual(h.total(rainfall.DAY, now), 0.11)
+
+    def test_load_prunes_expired_and_future_readings(self):
+        now = local(2026, 11, 15, 10, 0)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rain_history.json")
+            with open(path, "w") as f:
+                json.dump({"version": 1, "entity": ENTITY,
+                           "samples": [[now - 30 * 3600, 0.1], [now - 3600, 0.2], [now + 3600, 0.3]]}, f)
+            h = new_history(path)
+            h.load(now=now)
+            self.assertEqual(h.samples, [[now - 3600, 0.2]])
+
+    def test_malformed_reading_list_starts_fresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rain_history.json")
+            for samples in (5, "x", {"a": 1}, [5, None, ["a", 1]]):
+                with open(path, "w") as f:
+                    json.dump({"version": 1, "entity": ENTITY, "samples": samples}, f)
+                h = new_history(path)
+                h.load()
+                self.assertEqual(h.samples, [], samples)
+
+
+class ConfigCompatibility(unittest.TestCase):
+    def test_existing_options_still_valid_and_new_ones_optional(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "aprs_weather", "config.yaml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        options = re.search(r"^options:\n((?:  .*\n)+)", text, re.M).group(1)
+        schema = re.search(r"^schema:\n((?:  .*\n)+)", text, re.M).group(1)
+        opt_keys = re.findall(r"^  (\w+):", options, re.M)
+        schema_map = dict(re.findall(r"^  (\w+): (.+)$", schema, re.M))
+        self.assertEqual(opt_keys, ["callsign", "aprs_passcode", "latitude", "longitude", "dry_run",
+                                    "interval_seconds", "aprs_server", "aprs_port"])
+        for key in opt_keys:
+            self.assertIn(key, schema_map)
+        for key in ("rain_1h_entity", "rain_24h_entity"):
+            self.assertNotIn(key, opt_keys)
+            self.assertTrue(schema_map[key].endswith("?"), key)
+        self.assertIn('version: "1.1.1"', text)
+
+
 class MissingAndStale(unittest.TestCase):
     def test_no_current_reading(self):
         h = new_history()
@@ -404,6 +457,22 @@ class DryRun(unittest.TestCase):
         line, logs, _ = self.run_cycle(states, opts)
         self.assertIn("t041r003p061P014h87", line)
         self.assertIn("[sensor.davis_vantage_rain_last_hour]", logs)
+
+    def test_rain_processing_failure_never_blocks_report(self):
+        with mock.patch.object(publisher, "collect_rain", side_effect=RuntimeError("boom")):
+            line, logs, _ = self.run_cycle(self.states())
+        self.assertIn("_225/007g015t041h87b10132", line)
+        self.assertIn("Rainfall processing failed", logs)
+
+    def test_invalid_time_zone_never_blocks_report(self):
+        def fake_urlopen(*args, **kwargs):
+            raise OSError("no supervisor")
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             mock.patch.dict(os.environ, {"TZ": "Not/AZone"}):
+            self.assertIsNone(publisher.local_timezone("t"))
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = __import__("io").StringIO('{"time_zone": 123}')
+            self.assertIsNone(publisher.local_timezone("t"))
 
     def test_bad_configured_sensor_falls_back(self):
         opts = dict(OPTS, rain_1h_entity="sensor.missing", rain_24h_entity="../core/api/states")

@@ -57,8 +57,8 @@ def local_timezone(token):
     name = name or os.environ.get("TZ")
     try:
         return zoneinfo.ZoneInfo(name) if name else None
-    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
-        LOG.warning("Unknown time zone %r", name)
+    except Exception:
+        LOG.warning("Unknown time zone %r; midnight resets cannot be identified, so rolling totals may be omitted", name)
         return None
 
 
@@ -227,7 +227,12 @@ def run_cycle(opts, token, history):
     observed = observation_time(entities)
     if history.tz is None:
         history.tz = local_timezone(token)
-    rain = collect_rain(opts, token, history, observed)
+    try:
+        rain = collect_rain(opts, token, history, observed)
+    except Exception as exc:
+        # Rainfall must never block an otherwise valid weather report.
+        LOG.warning("Rainfall processing failed (%s); rainfall fields omitted this report", exc)
+        rain = {"r": None, "p": None, "P": None}
     line = packet(opts, entities, rain)
     if opts.get("dry_run", True):
         LOG.info("DRY RUN (not transmitted): %s", line)
@@ -252,7 +257,11 @@ def main():
                 raise RuntimeError("SUPERVISOR_TOKEN unavailable; check homeassistant_api setting")
             if history is None:
                 history = rainfall.RainHistory(RAIN_HISTORY, RAIN_DAY_SENSOR)
-                history.load()
+                try:
+                    history.load()
+                except Exception as exc:
+                    LOG.warning("Rainfall history could not be loaded (%s); starting fresh", exc)
+                    history.samples = []
             run_cycle(opts, token, history)
         except Exception as exc:
             LOG.error("Report skipped: %s", exc)

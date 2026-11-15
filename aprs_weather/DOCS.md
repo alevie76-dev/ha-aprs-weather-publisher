@@ -56,6 +56,8 @@ After first installing or upgrading, `r` appears after about **1 hour** and `p` 
 
 - Readings are 5 minutes apart, so a window can start up to one interval early. Rain in the interval straddling the window start is counted in full, which matches common weather-software practice.
 - Rain that falls in the few minutes between the last reading before midnight and the console's reset can be missed. Rain is never invented to fill that gap.
+- Reconstructed `r` and `p` need `interval_seconds` of 900 (15 minutes) or less. The default is 300. With longer intervals, any interval that crosses midnight, or that straddles a window start while it is raining, can't be attributed, so `r`/`p` are usually omitted. `P` is unaffected.
+- History is pruned to the last 26 hours. That keeps the reading at or before the 24-hour window start, and comes to about 313 readings (~8 KB) at the default interval.
 - Values of 10.00 in or more cannot be encoded in APRS's three digits and are omitted.
 
 ### Verifying in dry-run mode

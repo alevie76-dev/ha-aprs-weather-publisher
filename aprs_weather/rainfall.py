@@ -82,8 +82,12 @@ class RainHistory:
         if data.get("entity") != self.source_entity:
             LOG.warning("Rainfall history was recorded from a different sensor; starting fresh")
             return
+        raw = data.get("samples")
+        if not isinstance(raw, list):
+            LOG.warning("Rainfall history has no reading list; starting fresh")
+            return
         cleaned = {}
-        for item in data.get("samples", []):
+        for item in raw:
             try:
                 t, v = float(item[0]), float(item[1])
             except (TypeError, ValueError, IndexError):

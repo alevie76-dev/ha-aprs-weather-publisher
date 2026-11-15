@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__/
 *.pyc
+rain_history.json
+.rain_history.*
+options.json
