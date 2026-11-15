@@ -1,5 +1,5 @@
 name: "APRS-IS Weather Publisher"
-version: "0.1.0"
+version: "1.1.0"
 slug: "aprs_weather"
 description: "Publish Davis Vantage Vue Home Assistant sensors as APRS-IS weather packets"
 url: "https://github.com/alevie76-dev/ha-aprs-weather-publisher"
@@ -29,3 +29,5 @@ schema:
   interval_seconds: int(60,3600)
   aprs_server: str
   aprs_port: port
+  rain_1h_entity: str?
+  rain_24h_entity: str?

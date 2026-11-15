@@ -9,10 +9,14 @@ import socket
 import time
 import urllib.error
 import urllib.request
+import zoneinfo
+
+import rainfall
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("aprs_weather")
 OPTIONS = "/data/options.json"
+RAIN_HISTORY = "/data/rain_history.json"
 SENSORS = {
     "temperature": "sensor.davis_vantage_temperature",
     "humidity": "sensor.davis_vantage_humidity",
@@ -20,9 +24,13 @@ SENSORS = {
     "speed": "sensor.davis_vantage_wind_speed_average",
     "gust": "sensor.davis_vantage_wind_gust",
     "pressure": "sensor.davis_vantage_barometric_pressure",
-    "rain_day": "sensor.davis_vantage_rain_day",
     "last_success": "sensor.davis_vantage_last_success_time",
 }
+# Fetched separately so a rain-sensor problem omits only the rain fields.
+RAIN_DAY_SENSOR = "sensor.davis_vantage_rain_day"
+# Optional directly-reported rolling totals (inches): APRS field -> option name.
+ROLLING_RAIN_OPTIONS = {"r": "rain_1h_entity", "p": "rain_24h_entity"}
+ENTITY_ID = re.compile(r"sensor\.[a-z0-9_]+")
 
 
 def get_entity(entity_id, token):
@@ -32,6 +40,26 @@ def get_entity(entity_id, token):
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.load(response)
+
+
+def local_timezone(token):
+    """Home Assistant's configured time zone, falling back to the TZ variable."""
+    name = None
+    try:
+        request = urllib.request.Request(
+            "http://supervisor/core/api/config",
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            name = json.load(response).get("time_zone")
+    except Exception as exc:
+        LOG.warning("Could not read Home Assistant time zone (%s)", exc)
+    name = name or os.environ.get("TZ")
+    try:
+        return zoneinfo.ZoneInfo(name) if name else None
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        LOG.warning("Unknown time zone %r", name)
+        return None
 
 
 def numeric(entity, expected_unit=None):
@@ -61,7 +89,7 @@ def position(lat, lon):
     return coord(lat, True) + "/" + coord(lon, False) + "_"
 
 
-def packet(opts, entities):
+def observation_time(entities):
     last = entities["last_success"]["state"]
     try:
         timestamp = dt.datetime.fromisoformat(last.replace("Z", "+00:00"))
@@ -72,30 +100,54 @@ def packet(opts, entities):
     age = (dt.datetime.now(dt.timezone.utc) - timestamp).total_seconds()
     if age < -120 or age > 900:
         raise ValueError(f"Davis observations stale or clock incorrect (age {age:.0f}s)")
+    return timestamp
 
+
+def rain_day_value(entity):
+    """Inches since midnight from the daily counter, or raise ValueError."""
+    value = numeric(entity, "in")
+    if not (0 <= value <= rainfall.MAX_DAILY_IN):
+        raise ValueError(f"Implausible daily rain {value}")
+    return value
+
+
+def rain_field(letter, inches):
+    """APRS rain field in hundredths of an inch; empty (omitted) if unknown or too large."""
+    if inches is None:
+        return ""
+    hundredths = round(inches * 100)
+    if not 0 <= hundredths <= 999:
+        LOG.warning("Rain field %s value %.2f in exceeds APRS range; omitted", letter, inches)
+        return ""
+    return f"{letter}{hundredths:03d}"
+
+
+def packet(opts, entities, rain=None):
+    """Build the APRS packet. ``rain`` maps r/p/P to inches, or None to omit."""
+    observation_time(entities)
     temp = numeric(entities["temperature"], "°F")
     humidity = numeric(entities["humidity"], "%")
     direction = numeric(entities["direction"], "°")
     speed = numeric(entities["speed"], "mph")
     gust = numeric(entities["gust"], "mph")
     pressure_inhg = numeric(entities["pressure"], "inHg")
-    rain_day = numeric(entities["rain_day"], "in")
+    if rain is None:
+        rain = {"P": rain_day_value(entities["rain_day"])} if "rain_day" in entities else {}
     if not (-99 <= temp <= 140 and 0 <= humidity <= 100 and 0 <= speed <= 999 and 0 <= gust <= 999):
         raise ValueError("Temperature, humidity or wind reading outside expected range")
     if not (25 <= pressure_inhg <= 32):
         raise ValueError("Pressure outside plausible sea-level inHg range; verify Davis sensor mapping")
-    if not (0 <= rain_day <= 9.99):
-        raise ValueError("Daily rain out of APRS range")
     if not (0 <= direction <= 360):
         raise ValueError("Invalid wind direction")
     h = 0 if round(humidity) == 100 else round(humidity)
     pressure_tenths = round(pressure_inhg * 33.8638866667 * 10)
-    # P is precipitation since midnight, in hundredths of an inch.
-    # r/p omitted until true rolling 1h/24h accumulation is implemented.
+    # APRS order: r (last 60 min), p (last 24 h), P (since midnight),
+    # hundredths of an inch. Unknown values are omitted, never sent as zero.
     weather = (
         f"{round(direction) % 360:03d}/{round(speed):03d}"
         f"g{round(gust):03d}t{round(temp):03d}"
-        f"P{round(rain_day * 100):03d}h{h:02d}b{pressure_tenths:05d}"
+        f"{rain_field('r', rain.get('r'))}{rain_field('p', rain.get('p'))}{rain_field('P', rain.get('P'))}"
+        f"h{h:02d}b{pressure_tenths:05d}"
     )
     source = opts["callsign"].upper().strip()
     if not re.fullmatch(r"[A-Z0-9]{1,6}(?:-[0-9]{1,2})?", source):
@@ -130,7 +182,62 @@ def publish(opts, line):
         LOG.info("Sent APRS-IS weather packet for %s", opts["callsign"])
 
 
+def _describe(inches):
+    return "unavailable (omitted)" if inches is None else f"{inches:.2f} in"
+
+
+def collect_rain(opts, token, history, observed):
+    """Return {"r", "p", "P"} in inches (None = omit) and update history."""
+    rain = {"r": None, "p": None, "P": None}
+    sources = {"r": "reconstructed", "p": "reconstructed", "P": RAIN_DAY_SENSOR}
+    now = observed.timestamp()
+    try:
+        rain["P"] = rain_day_value(get_entity(RAIN_DAY_SENSOR, token))
+    except Exception as exc:
+        LOG.warning("Daily rainfall unavailable (%s); rainfall fields omitted this report", exc)
+    if rain["P"] is not None:
+        history.add(now, rain["P"])
+        history.save()
+        rain["r"] = history.total(rainfall.HOUR, now)
+        rain["p"] = history.total(rainfall.DAY, now)
+    for field, option in ROLLING_RAIN_OPTIONS.items():
+        entity_id = str(opts.get(option) or "").strip()
+        if not entity_id:
+            continue
+        try:
+            if not ENTITY_ID.fullmatch(entity_id):
+                raise ValueError("not a sensor entity id")
+            value = numeric(get_entity(entity_id, token), "in")
+            if value < 0:
+                raise ValueError("negative rainfall")
+            rain[field], sources[field] = value, entity_id
+        except Exception as exc:
+            LOG.warning("Configured %s %r unusable (%s); using reconstructed total", option, entity_id, exc)
+    LOG.info(
+        "Rainfall: since midnight (P) %s; last 60 min (r) %s [%s]; last 24 h (p) %s [%s]; history %.1f h",
+        _describe(rain["P"]), _describe(rain["r"]), sources["r"], _describe(rain["p"]), sources["p"],
+        history.coverage_hours(now),
+    )
+    return rain
+
+
+def run_cycle(opts, token, history):
+    """Fetch sensors, build one packet, and log or transmit it. Returns the packet."""
+    entities = {key: get_entity(value, token) for key, value in SENSORS.items()}
+    observed = observation_time(entities)
+    if history.tz is None:
+        history.tz = local_timezone(token)
+    rain = collect_rain(opts, token, history, observed)
+    line = packet(opts, entities, rain)
+    if opts.get("dry_run", True):
+        LOG.info("DRY RUN (not transmitted): %s", line)
+    else:
+        publish(opts, line)
+    return line
+
+
 def main():
+    history = None
     while True:
         interval = 300
         try:
@@ -143,12 +250,10 @@ def main():
             token = os.environ.get("SUPERVISOR_TOKEN")
             if not token:
                 raise RuntimeError("SUPERVISOR_TOKEN unavailable; check homeassistant_api setting")
-            entities = {key: get_entity(value, token) for key, value in SENSORS.items()}
-            line = packet(opts, entities)
-            if opts.get("dry_run", True):
-                LOG.info("DRY RUN (not transmitted): %s", line)
-            else:
-                publish(opts, line)
+            if history is None:
+                history = rainfall.RainHistory(RAIN_HISTORY, RAIN_DAY_SENSOR)
+                history.load()
+            run_cycle(opts, token, history)
         except Exception as exc:
             LOG.error("Report skipped: %s", exc)
         time.sleep(interval)
